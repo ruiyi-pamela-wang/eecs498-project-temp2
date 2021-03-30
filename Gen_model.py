@@ -12,6 +12,7 @@ import math
 import json
 import copy
 import random
+import os
 from tqdm import tqdm
 from transformers import *
 
@@ -38,7 +39,7 @@ def Hanlp_tokenizer(text_str:str, vocab_dict=token2num)->list:
 
 
 class PositionalEncoding(nn.Module):
-    def __init__(self, d_model, dropout=0.1, max_len=50):
+    def __init__(self, d_model, dropout=0.1, max_len=500):
         super(PositionalEncoding, self).__init__()
         self.dropout = nn.Dropout(p=dropout)
 
@@ -377,7 +378,7 @@ class findattribute(nn.Module):
 
         return y.to(self.DEVICE)
 
-    def att_prob(self, token_idx, sentiment):
+    def att_prob(self, token_idx, style):
         """
         token_idx: (batch, seq_len)
         """
@@ -386,7 +387,7 @@ class findattribute(nn.Module):
         for i in range(len(token_list)):
             del_list = token_list[:i] + token_list[i + 1:]
             del_tensor = torch.from_numpy(np.asarray(del_list)).unsqueeze(0).to(self.DEVICE)
-            del_prob = F.softmax(self.discriminator(del_tensor), 1).squeeze(0)[sentiment].cpu().detach().numpy().item()
+            del_prob = F.softmax(self.discriminator(del_tensor), 1).squeeze(0)[style].cpu().detach().numpy().item()
 
             if del_prob <= min_prob:
                 max_ind = i
@@ -407,17 +408,13 @@ class findattribute(nn.Module):
         return cls_loss.to(self.DEVICE)
 
 
-DEVICE = 'cuda:0' if torch.cuda.is_available() else 'cpu'
+DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 genmodel = styletransfer(vocab_size=vocab_size).to(DEVICE)
-# genmodel.load_state_dict(torch.load('../ST_v2.0/models/gen_model_5'))
+# genmodel.load_state_dict(torch.load('./Generator/models/gen_model_0'))
 genmodel.train()
-
-import sys
-
-# sys.path.insert(0, "/DATA/joosung/controllable_english/amazon/classifier/")
 dismodel = findattribute(vocab_size=vocab_size).to(DEVICE)
-dismodel_name = 'cls_model_5'
+dismodel_name = 'cls_model_6'
 dismodel.load_state_dict(torch.load('./models/{}'.format(dismodel_name)))
 dismodel.eval()
 
@@ -448,6 +445,11 @@ print('Data Loaded!')
 recon_loss_list, gen_cls_loss_list = [], []
 
 
+# with open('reconstruct_loss.json', 'r') as trg:
+#     recon_loss_list = json.load(trg)
+# with open('gen_cls_loss.json', 'r') as trg:
+#     gen_cls_loss_list = json.load(trg)
+
 def main():
     merge_dict_json = './merged_vocab.json'
     with open(merge_dict_json, 'r', encoding='utf-8') as dict_json:
@@ -458,15 +460,11 @@ def main():
         num2token[value] = key
     print('Corpus Loaded!')
 
-    train_news_set, val_news_set, train_poems_set, val_poems_set = [news for news in news_train_ids if
-                                                                    len(news) < 50], [news for news in news_val_ids if
-                                                                                      len(news) < 50], [poems for poems
-                                                                                                        in
-                                                                                                        poems_train_ids
-                                                                                                        if len(
-            poems) < 50], [poems for poems in poems_val_ids if len(poems) < 50]
-    total_news_set = train_news_set + val_news_set
-    news_set = random.sample(total_news_set, len(total_news_set) // 20)
+    train_news_set, val_news_set, train_poems_set, val_poems_set = [news for news in news_train_ids if len(news) < 50], \
+                                                                   [news for news in news_val_ids if len(news) < 50], \
+                                                                   [poems for poems in poems_train_ids if len(poems) < 50], \
+                                                                   [poems for poems in poems_val_ids if len(poems) < 50]
+    news_set = train_news_set
     poems_set = train_poems_set + val_poems_set
     news_len, poems_len = len(news_set), len(poems_set)
     print('#News Lines:', news_len)
@@ -474,21 +472,21 @@ def main():
 
     """training parameter"""
     aed_initial_lr = 0.00001
-    gen_initial_lr = 0.001
+    gen_initial_lr = 0.0001
     ### aed_trainer: Auto-Encoder--> Find features
     aed_trainer = optim.Adamax(genmodel.aed_params, lr=aed_initial_lr)  # initial 0.0005
     gen_trainer = optim.Adamax(genmodel.aed_params, lr=gen_initial_lr)  # initial 0.0001
     max_grad_norm = 10
     BATCH_SIZE = 1
-    NUM_EPOCH = 6
+    NUM_EPOCH = 10
     epoch_len = min(poems_len, news_len)
     stop_point = epoch_len * NUM_EPOCH
 
-    pre_epoch = 0
+
     running_recon_loss, running_gen_loss = 0.0, 0.0
     for start in tqdm(range(0, stop_point)):
         ## learing rate decay
-        now_epoch = (start + 1) // news_len
+        cur_epoch = (start + 1) // news_len
 
         """data start point"""
         news_start = start % news_len
@@ -516,7 +514,6 @@ def main():
             seq = seqs[i]
             attribute = attributes[i]  # for decoder
             fake_attribute = attributes[abs(1 - i)]  # for generate
-            #             sentiment = sentiments[i] # for delete
 
             token_idx = torch.tensor(seq).unsqueeze(0).to(DEVICE)
 
@@ -561,22 +558,28 @@ def main():
 
         """savining point"""
         if (start + 1) % epoch_len == 0:
-            recon_loss_list.append(running_recon_loss / (len(total_news_set) // 20))
-            gen_cls_loss_list.append(running_gen_loss / (len(total_news_set) // 20))
-            running_recon_loss, running_gen_loss = 0.0, 0.0
+            recon_loss_list.append(running_recon_loss / (len(news_set)))
+            gen_cls_loss_list.append(running_gen_loss / (len(news_set)))
             print(
-                f'Epoch: {(start + 1) // epoch_len} | Recon_loss: {running_recon_loss / (len(total_news_set) // 20)} | Gen_cls_loss:{running_gen_loss / (len(total_news_set) // 20)}')
-            news_set = random.sample(total_news_set, len(total_news_set) // 20)
-            #             random.shuffle(news_set)
+                f'Epoch: {(start + 1) // epoch_len} | Recon_loss: {running_recon_loss / (len(news_set))} | Gen_cls_loss:{running_gen_loss / (len(news_set))}')
+            running_recon_loss, running_gen_loss = 0.0, 0.0
             random.shuffle(poems_set)
-            save_model(genmodel, (start + 1) // poems_len)
+            save_model(genmodel, (start + 1) // epoch_len)
     save_model(genmodel, 'final')  # final_model
+    save_stats(recon_loss_list, gen_cls_loss_list)
 
 
 def save_model(gen_model, iter):
     if not os.path.exists('./Generator/models/'):
         os.makedirs('./Generator/models/')
     torch.save(gen_model.state_dict(), './Generator/models/gen_model_{}'.format(iter))
+
+
+def save_stats(recon_loss_list, gen_loss_list):
+    with open('reconstruct_loss.json', 'w') as trg:
+        json.dump(recon_loss_list, trg)
+    with open('gen_cls_loss.json', 'w') as trg:
+        json.dump(gen_loss_list, trg)
 
 
 if __name__ == '__main__':
